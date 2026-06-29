@@ -9,6 +9,7 @@ import sys
 import time
 import random
 import argparse
+import itertools
 
 try:
     import requests
@@ -37,35 +38,54 @@ ACCEPT_HEADERS = [
     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 ]
 
+# Max consecutive failures before a proxy is quarantined for the rest of the run
+MAX_PROXY_FAILURES = 3
+# Max retries per visit slot before giving up
+MAX_RETRIES = 3
+
 
 # ── Webshare Functions ────────────────────────────────────────────────────────
 
-def get_proxy_list(token, mode="direct", page_size=100):
+def get_proxy_list(token, mode="direct"):
     """
-    Fetch proxy list from Webshare API.
+    Fetch the full proxy list from Webshare API, following pagination.
     mode: 'direct' or 'backbone'
     """
     headers = {"Authorization": "Token {}".format(token)}
-    params = {"mode": mode, "page": 1, "page_size": page_size}
-    try:
-        resp = requests.get(
-            "{}/proxy/list/".format(WEBSHARE_API_BASE),
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
+    proxies = []
+    page = 1
+    page_size = 100
+
+    while True:
+        params = {"mode": mode, "page": page, "page_size": page_size}
+        try:
+            resp = requests.get(
+                "{}/proxy/list/".format(WEBSHARE_API_BASE),
+                headers=headers,
+                params=params,
+                timeout=15,
+            )
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                print("[ERROR] Invalid Webshare API token. Check WEBSHARE_API_TOKEN.")
+            else:
+                print("[ERROR] Failed to fetch proxies (page {}): {}".format(page, e))
+            break
+        except Exception as e:
+            print("[ERROR] Could not connect to Webshare API: {}".format(e))
+            break
+
         data = resp.json()
-        return data.get("results", [])
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 401:
-            print("[ERROR] Invalid Webshare API token. Check WEBSHARE_API_TOKEN.")
-        else:
-            print("[ERROR] Failed to fetch proxies: {}".format(e))
-        return []
-    except Exception as e:
-        print("[ERROR] Could not connect to Webshare API: {}".format(e))
-        return []
+        batch = data.get("results", [])
+        proxies.extend(batch)
+
+        # Webshare uses 'next' field (URL string or null) for pagination
+        if not data.get("next"):
+            break
+        page += 1
+
+    return proxies
 
 
 def format_proxy(proxy_obj):
@@ -78,14 +98,73 @@ def format_proxy(proxy_obj):
     return {"http": proxy_url, "https": proxy_url}
 
 
+def proxy_label(proxy_obj):
+    return "{}:{}".format(proxy_obj.get("proxy_address", "?"), proxy_obj.get("port", "?"))
+
+
+# ── Rotating pool ─────────────────────────────────────────────────────────────
+
+class ProxyPool:
+    """
+    Deterministic rotating pool — iterates through the full shuffled list
+    before repeating. Quarantines proxies that fail MAX_PROXY_FAILURES times.
+    """
+
+    def __init__(self, proxies):
+        self._all = list(proxies)
+        self._quarantine = {}  # proxy_label -> failure count
+        self._cycle = self._new_cycle()
+
+    def _active(self):
+        return [p for p in self._all if self._quarantine.get(proxy_label(p), 0) < MAX_PROXY_FAILURES]
+
+    def _new_cycle(self):
+        pool = self._active()
+        random.shuffle(pool)
+        return itertools.cycle(pool) if pool else None
+
+    def next(self):
+        """Return the next proxy, skipping quarantined ones."""
+        active = self._active()
+        if not active:
+            return None
+        # Rebuild cycle when active pool shrinks significantly
+        if self._cycle is None:
+            self._cycle = self._new_cycle()
+        for _ in range(len(self._all) * 2):
+            proxy = next(self._cycle)
+            if self._quarantine.get(proxy_label(proxy), 0) < MAX_PROXY_FAILURES:
+                return proxy
+        return None
+
+    def record_failure(self, proxy_obj):
+        label = proxy_label(proxy_obj)
+        self._quarantine[label] = self._quarantine.get(label, 0) + 1
+        if self._quarantine[label] >= MAX_PROXY_FAILURES:
+            print("       [~] Proxy {} quarantined after {} failures.".format(label, MAX_PROXY_FAILURES))
+
+    def record_success(self, proxy_obj):
+        label = proxy_label(proxy_obj)
+        # Reset failure counter on success
+        if label in self._quarantine:
+            self._quarantine[label] = 0
+
+    @property
+    def active_count(self):
+        return len(self._active())
+
+    @property
+    def total_count(self):
+        return len(self._all)
+
+
 # ── Visitor Function ──────────────────────────────────────────────────────────
 
 def visit_url(url, proxy_obj, timeout=15, verbose=False):
     """
     Send an HTTP GET request to url through the given proxy.
-    Returns (success: bool, status_code: int or None, proxy_addr: str)
+    Returns (success: bool, status_code: int or None)
     """
-    proxy_addr = "{}:{}".format(proxy_obj.get("proxy_address", ""), proxy_obj.get("port", ""))
     proxies = format_proxy(proxy_obj)
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
@@ -101,19 +180,19 @@ def visit_url(url, proxy_obj, timeout=15, verbose=False):
         resp = requests.get(url, proxies=proxies, headers=headers, timeout=timeout, allow_redirects=True)
         if verbose:
             print("       Response: {} | {} bytes".format(resp.status_code, len(resp.content)))
-        return (resp.status_code < 400, resp.status_code, proxy_addr)
+        return (resp.status_code < 400, resp.status_code)
     except requests.exceptions.ProxyError:
         if verbose:
-            print("       Proxy error (skipping)")
-        return (False, None, proxy_addr)
+            print("       Proxy error")
+        return (False, None)
     except requests.exceptions.ConnectTimeout:
         if verbose:
-            print("       Timeout (skipping)")
-        return (False, None, proxy_addr)
+            print("       Timeout")
+        return (False, None)
     except Exception as e:
         if verbose:
             print("       Error: {}".format(e))
-        return (False, None, proxy_addr)
+        return (False, None)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -146,8 +225,25 @@ Examples:
     return parser.parse_args()
 
 
+def validate_args(args):
+    errors = []
+    if args.count < 1:
+        errors.append("--count must be at least 1 (got {})".format(args.count))
+    if args.delay < 0:
+        errors.append("--delay cannot be negative (got {})".format(args.delay))
+    if args.timeout < 1:
+        errors.append("--timeout must be at least 1 second (got {})".format(args.timeout))
+    if not args.url.startswith(("http://", "https://")):
+        errors.append("URL must start with http:// or https:// (got '{}')".format(args.url))
+    if errors:
+        for e in errors:
+            print("[ERROR] {}".format(e))
+        sys.exit(1)
+
+
 def main():
     args = parse_args()
+    validate_args(args)
 
     # ── Resolve API token ──────────────────────────────────────────────────────
     token = args.token or os.environ.get("WEBSHARE_API_TOKEN", "")
@@ -165,37 +261,53 @@ def main():
     print("  Mode    : {}".format(args.mode))
     print("=" * 60)
 
-    # ── Fetch proxies ──────────────────────────────────────────────────────────
+    # ── Fetch full proxy list (paginated) ──────────────────────────────────────
     print("\n[*] Fetching proxy list from Webshare...")
-    proxies = get_proxy_list(token, mode=args.mode)
-    if not proxies:
+    raw_proxies = get_proxy_list(token, mode=args.mode)
+    if not raw_proxies:
         print("[ERROR] No proxies available. Check your Webshare plan or API token.")
         sys.exit(1)
-    print("[+] Loaded {} proxies.\n".format(len(proxies)))
+
+    pool = ProxyPool(raw_proxies)
+    print("[+] Loaded {} proxies.\n".format(pool.total_count))
 
     # ── Visit loop ─────────────────────────────────────────────────────────────
     success_count = 0
     failed_count = 0
 
     for i in range(args.count):
-        proxy = random.choice(proxies)
-        proxy_addr = "{}:{}".format(proxy.get("proxy_address", ""), proxy.get("port", ""))
+        # Retry up to MAX_RETRIES times per visit slot
+        slot_ok = False
+        for attempt in range(1, MAX_RETRIES + 1):
+            proxy = pool.next()
+            if proxy is None:
+                print("[{}/{}] No active proxies remaining. Stopping.".format(i + 1, args.count))
+                break
 
-        print("[{}/{}] Visiting via {} ...".format(i + 1, args.count, proxy_addr), end="")
-        sys.stdout.flush()
+            label = proxy_label(proxy)
+            suffix = "" if attempt == 1 else " (retry {}/{})".format(attempt, MAX_RETRIES)
+            print("[{}/{}] via {}{}...".format(i + 1, args.count, label, suffix), end="")
+            sys.stdout.flush()
 
-        ok, status, _ = visit_url(args.url, proxy, timeout=args.timeout, verbose=args.verbose)
+            ok, status = visit_url(args.url, proxy, timeout=args.timeout, verbose=args.verbose)
 
-        if ok:
+            if ok:
+                pool.record_success(proxy)
+                status_str = "OK ({})".format(status) if status else "OK"
+                print("  [SUCCESS] {}".format(status_str))
+                slot_ok = True
+                break
+            else:
+                pool.record_failure(proxy)
+                status_str = "({})".format(status) if status else "(no response)"
+                print("  [FAILED] {}".format(status_str))
+
+        if slot_ok:
             success_count += 1
-            status_str = "OK ({})".format(status) if status else "OK"
-            print("  [SUCCESS] {}".format(status_str))
         else:
             failed_count += 1
-            status_str = "({})".format(status) if status else "(no response)"
-            print("  [FAILED] {}".format(status_str))
 
-        if i < args.count - 1:
+        if i < args.count - 1 and args.delay > 0:
             time.sleep(args.delay)
 
     # ── Summary ────────────────────────────────────────────────────────────────
@@ -207,6 +319,7 @@ def main():
     print("  Total   : {}".format(total))
     print("  Success : {} ({:.1f}%)".format(success_count, rate))
     print("  Failed  : {}".format(failed_count))
+    print("  Proxies : {}/{} still active".format(pool.active_count, pool.total_count))
     print("=" * 60)
 
 
