@@ -1,0 +1,27 @@
+kind = "web"
+previewPath = "/"
+title = "AutoVisitor Premium"
+version = "1.0.0"
+id = "artifacts/autovisitor-web"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 21719
+
+[services.development]
+run = "pnpm --filter @workspace/autovisitor-web run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/autovisitor-web", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/autovisitor-web/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "21719"
+BASE_PATH = "/"

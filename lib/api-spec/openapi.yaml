@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: autovisitor
+    description: AutoVisitor traffic booster operations
 paths:
   /healthz:
     get:
@@ -24,6 +26,85 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /autovisitor/start:
+    post:
+      operationId: startSession
+      tags: [autovisitor]
+      summary: Start a visit session
+      description: Start visiting a URL through Webshare rotating proxies
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionInput"
+      responses:
+        "200":
+          description: Session started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionStarted"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /autovisitor/status/{sessionId}:
+    get:
+      operationId: getSessionStatus
+      tags: [autovisitor]
+      summary: Get session status
+      description: Poll the current progress of a visit session
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionStatus"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /autovisitor/stop/{sessionId}:
+    post:
+      operationId: stopSession
+      tags: [autovisitor]
+      summary: Stop a session
+      description: Stop an active visit session early
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionStatus"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +115,100 @@ components:
       required:
         - status
 
+    SessionInput:
+      type: object
+      required:
+        - token
+        - url
+        - count
+      properties:
+        token:
+          type: string
+          description: Webshare API token
+        url:
+          type: string
+          description: Target URL to visit
+        count:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: Number of visits to send
+        delay:
+          type: number
+          minimum: 0
+          description: Delay in seconds between visits (default 1.0)
+        mode:
+          type: string
+          enum: [direct, backbone]
+          description: Webshare proxy mode (default direct)
+
+    SessionStarted:
+      type: object
+      required:
+        - sessionId
+        - status
+      properties:
+        sessionId:
+          type: string
+        status:
+          type: string
+
+    VisitLog:
+      type: object
+      required:
+        - index
+        - proxy
+        - success
+        - timestamp
+      properties:
+        index:
+          type: integer
+        proxy:
+          type: string
+        success:
+          type: boolean
+        statusCode:
+          type: ["integer", "null"]
+        timestamp:
+          type: string
+
+    SessionStatus:
+      type: object
+      required:
+        - sessionId
+        - state
+        - total
+        - success
+        - failed
+        - completed
+        - logs
+      properties:
+        sessionId:
+          type: string
+        state:
+          type: string
+          enum: [pending, running, done, stopped, error]
+        total:
+          type: integer
+        success:
+          type: integer
+        failed:
+          type: integer
+        completed:
+          type: integer
+        proxyCount:
+          type: ["integer", "null"]
+        errorMessage:
+          type: ["string", "null"]
+        logs:
+          type: array
+          items:
+            $ref: "#/components/schemas/VisitLog"
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
